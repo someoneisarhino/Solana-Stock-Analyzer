@@ -1,11 +1,16 @@
 import base64
+import json
 import os
 import time
 from decimal import Decimal, ROUND_CEILING
+from urllib import response
+import re
 
+import google.generativeai as genai
 import requests
 import yfinance as yf
 from dotenv import load_dotenv
+from google.api_core.exceptions import GoogleAPICallError
 from solders.keypair import Keypair
 from solders.message import to_bytes_versioned
 from solders.transaction import VersionedTransaction
@@ -41,19 +46,26 @@ def evaluate_stock_trade_decision(ticker_symbol, safety_volume_threshold=1000000
     is_safe_liquidity = current_volume >= safety_volume_threshold
     
     safety_metrics = {
-        "current_volume": current_volume,
-        "is_safe_liquidity": is_safe_liquidity,
-        "volume_threshold": safety_volume_threshold
+        "current_volume": float(current_volume),
+        "is_safe_liquidity": bool(is_safe_liquidity),
+        "volume_threshold": safety_volume_threshold,
+        "current_price": float(current_price),
     }
-    
+
+    if len(past_prices) >= 3:
+        avg_price = sum(past_prices) / len(past_prices)
+        deviation = (current_price - avg_price) / avg_price * 100
+        safety_metrics.update({
+            "moving_average": float(avg_price),
+            "deviation_pct": float(deviation),
+            "comparison_periods": len(past_prices),
+        })
+
     if not is_safe_liquidity:
         return f"HOLD / DO NOT TRADE (High volatility risk: trading volume {current_volume:,} is below safety threshold of {safety_volume_threshold:,})", safety_metrics
         
     if len(past_prices) < 3:
         return "HOLD (Gathering historical data points...)", safety_metrics
-        
-    avg_price = sum(past_prices) / len(past_prices)
-    deviation = (current_price - avg_price) / avg_price * 100
     
     print(f"Current Price: ${current_price:.2f} | MA({len(past_prices)} hours): ${avg_price:.2f} | Deviation: {deviation:+.2f}%")
     
@@ -67,6 +79,104 @@ def evaluate_stock_trade_decision(ticker_symbol, safety_volume_threshold=1000000
         decision_str = "HOLD (Price is stable within safe boundaries)"
         
     return decision_str, safety_metrics
+
+
+import json
+import os
+import re
+import google.generativeai as genai
+import yfinance as yf
+
+def generate_stock_background(ticker_symbol, decision, algorithm_metrics):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set in the environment or .env file.")
+
+    daily_history = yf.Ticker(ticker_symbol).history(period="1y", interval="1d")
+    if daily_history.empty or daily_history["Close"].dropna().empty:
+        raise ValueError(f"No one-year daily price history is available for {ticker_symbol}.")
+
+    closes = daily_history["Close"].dropna()
+    first_close = float(closes.iloc[0])
+    latest_close = float(closes.iloc[-1])
+    if first_close <= 0:
+        raise ValueError(f"Invalid historical price data for {ticker_symbol}.")
+
+    # Compact facts payload to prevent token bloat
+    compact_facts = {
+        "ticker": ticker_symbol,
+        "decision": decision,
+        "1y_change_pct": round((latest_close - first_close) / first_close * 100, 2),
+        "1y_high": round(float(closes.max()), 2),
+        "1y_low": round(float(closes.min()), 2),
+        "latest_close": round(latest_close, 2),
+        "metrics": algorithm_metrics,
+    }
+
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=(
+            "You are a stock-history analysis agent. Return exactly 4 short sentences "
+            "as a JSON object with key 'sentences' containing an array of strings."
+        ),
+    )
+
+    prompt = (
+        "Write 4 concise background sentences about this stock based on these facts: "
+        + json.dumps(compact_facts)
+    )
+
+    response = gemini_model.generate_content(
+        prompt,
+        generation_config={
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "sentences": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                    }
+                },
+                "required": ["sentences"],
+            },
+            "temperature": 0.1,
+            "max_output_tokens": 1500,  # Generous headroom to prevent truncation
+        },
+        request_options={"timeout": 30},
+    )
+
+    text = response.text.strip() if response and response.text else ""
+
+    # Clean markdown wrappers if present
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    sentences = []
+
+    # Standard JSON parse
+    try:
+        result = json.loads(text)
+        sentences = result.get("sentences", [])
+    except json.JSONDecodeError:
+        # Fallback: Extract completed quoted strings from truncated JSON
+        matches = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+        # Filter out the key name 'sentences'
+        sentences = [m for m in matches if m != "sentences" and len(m) > 10]
+
+    if not sentences:
+        raise ValueError("Gemini returned no parseable sentences.")
+
+    # Return up to 4 cleaned sentences as a single paragraph
+    cleaned = [s.strip() for s in sentences if isinstance(s, str) and s.strip()]
+    return " ".join(cleaned[:4])
 
 
 def jupiter_get(url, params):
@@ -303,8 +413,18 @@ def main():
     if not ticker_symbol:
         raise ValueError("A stock ticker is required.")
 
-    decision, _ = evaluate_stock_trade_decision(ticker_symbol)
+    decision, stock_safety = evaluate_stock_trade_decision(ticker_symbol)
     print(f"\n=== Stock Decision Engine Result ===\n{decision}")
+
+    try:
+        background = generate_stock_background(
+            ticker_symbol,
+            decision,
+            stock_safety or {},
+        )
+        print(f"\n=== Gemini Flash Stock Background ===\n{background}")
+    except (GoogleAPICallError, requests.RequestException, ValueError, TypeError) as e:
+        print(f"\n[Gemini Agent Warning] Could not generate stock background: {e}")
 
     if not decision.startswith("BUY SIGNAL"):
         print("No Solana swap proposed for this decision.")
