@@ -376,8 +376,8 @@ function App() {
             <section className="space-y-6">
               <div className="flex flex-wrap items-end justify-between gap-4">
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Exchange-traded funds</p>
-                  <h1 className="mt-2 text-3xl font-bold">Popular funds</h1>
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Exchange-traded Funds</p>
+                  <h1 className="mt-2 text-3xl font-bold">Popular Funds</h1>
                   <p className="mt-2 max-w-2xl text-sm text-slate-400">Broad-market, sector, bond and commodity ETFs with Yahoo Finance price history. Select a fund to run the same decision engine and Gemini background used for stocks.</p>
                 </div>
                 <TimeframeToggle value={timeframe} onChange={setTimeframe} />
@@ -412,7 +412,7 @@ function App() {
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Stock decision engine</p>
               <h1 className="mt-2 text-3xl font-bold">Analyze a ticker</h1>
-              <p className="mt-2 text-sm text-slate-400">The server runs the Python algorithm and Gemini Flash summary; no trade is submitted without your approval.</p>
+              <p className="mt-2 text-sm text-slate-400">The server runs the analysis and summary; no trade is submitted without your approval.</p>
             </div>
             <form className="flex max-w-3xl gap-3" onSubmit={(event) => { event.preventDefault(); void runAnalysis(); }}>
               <label className="relative flex-1">
