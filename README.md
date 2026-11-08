@@ -11,13 +11,13 @@ handled by Python; API keys and the Solana key stay in the local `.env` file.
 - A `.env` file in the project root containing the credentials you want to use:
 
 ```dotenv
+# Requires Gemini 2.5-Flash API key, Gemini 3.8-Flash uses different configurations and code
 GEMINI_API_KEY=
 SOLANA_PRIVATE_KEY=
 # Optional: improves Jupiter API rate limits
 JUPITER_API_KEY=
-# Optional; defaults to gemini-2.5-flash
-GEMINI_MODEL=gemini-2.5-flash
 ```
+SOLANA_PRIVATE_KEY should be in Base58 and be either 32-byte or 64-byte.
 
 Never commit or share `.env`.
 
@@ -58,3 +58,12 @@ The dashboard only submits a Jupiter trade after a fresh server-side BUY
 decision, eligibility confirmation, and an exact typed trade confirmation.
 Tokenized stock swaps are not brokerage orders and may not deliver exactly one
 token/share.
+
+## Features:
+- Popular stock trends
+- Analysis of stocks, featuring popular evaluation metrics
+- Google Gemini driven summary of each stock
+- Buy/Sell/Hold conclusions for each stock
+- Convenient Solana buying option for recommended stocks through Jupiter
+
+Some trades cannot be made through Solana because Jupiter doesn't support certain ones through their API (ex. NVDA)
