@@ -171,12 +171,10 @@ def generate_stock_background(ticker_symbol, decision, algorithm_metrics):
         # Filter out the key name 'sentences'
         sentences = [m for m in matches if m != "sentences" and len(m) > 10]
 
-    if not sentences:
-        raise ValueError("Gemini returned no parseable sentences.")
-
-    # Return up to 4 cleaned sentences as a single paragraph
     cleaned = [s.strip() for s in sentences if isinstance(s, str) and s.strip()]
-    return " ".join(cleaned[:4])
+    if not cleaned:
+        raise ValueError("Gemini returned no usable background text.")
+    return " ".join(cleaned)
 
 
 def jupiter_get(url, params):
@@ -296,117 +294,172 @@ def sign_transaction_for_wallet(
     return VersionedTransaction.populate(versioned_tx.message, signatures)
 
 
-def execute_tokenized_stock_purchase(
-    private_key_b58: str,
+def prepare_tokenized_stock_purchase(
     ticker_symbol: str,
-    trade_reason: str,
-):
-    """
-    Target one xStocks token using Jupiter's live quote and require approval.
-    """
-    try:
-        keypair = keypair_from_base58_secret(private_key_b58)
-        user_public_key = str(keypair.pubkey())
-    except Exception as e:
-        print(f"[Error] Could not initialize the configured wallet ({type(e).__name__}).")
-        return
+    private_key_b58: str | None = None,
+) -> dict:
+    private_key_b58 = private_key_b58 or os.getenv("SOLANA_PRIVATE_KEY")
+    if not private_key_b58:
+        raise ValueError("SOLANA_PRIVATE_KEY is not configured.")
 
-    try:
-        token = find_tokenized_stock(ticker_symbol)
-        decimals = token["decimals"]
-        target_amount = 10 ** decimals
-        estimated_input = int(
-            (Decimal(str(token["usdPrice"])) * Decimal(1_000_000)).to_integral_value(
-                rounding=ROUND_CEILING
-            )
+    keypair = keypair_from_base58_secret(private_key_b58)
+    user_public_key = str(keypair.pubkey())
+    token = find_tokenized_stock(ticker_symbol)
+    decimals = token["decimals"]
+    target_amount = 10 ** decimals
+    estimated_input = int(
+        (Decimal(str(token["usdPrice"])) * Decimal(1_000_000)).to_integral_value(
+            rounding=ROUND_CEILING
         )
-        sizing_order = get_jupiter_order(estimated_input, token["id"])
-        input_amount = int(
-            (
-                Decimal(estimated_input)
-                * Decimal(target_amount)
-                / Decimal(sizing_order["outAmount"])
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        order = get_jupiter_order(input_amount, token["id"], user_public_key)
-    except Exception as e:
-        print(f"[Error] Could not prepare a verified {ticker_symbol} stock-token order: {e}")
-        return
-
-    try:
-        raw_transaction = order.get("transaction")
-        if not raw_transaction or not order.get("requestId"):
-            raise ValueError("Jupiter did not return an executable order.")
-        versioned_tx = VersionedTransaction.from_bytes(base64.b64decode(raw_transaction))
-        if user_public_key not in {
-            str(pubkey)
-            for pubkey in versioned_tx.message.account_keys[
-                :versioned_tx.message.header.num_required_signatures
-            ]
-        }:
-            raise ValueError(
-                "The configured wallet is not a required signer for this Jupiter order."
-            )
-    except Exception as e:
-        print(f"[Error] Failed to prepare the Jupiter transaction: {e}")
-        return
-
-    try:
-        expected_output = int(order["outAmount"])
-        minimum_output = int(order.get("otherAmountThreshold", expected_output))
-        actual_input = int(order["inAmount"])
-    except (KeyError, TypeError, ValueError) as e:
-        print(f"[Error] Jupiter returned invalid quote details: {e}")
-        return
-
-    output_scale = Decimal(10) ** decimals
-    estimated_tokens = Decimal(expected_output) / output_scale
-    minimum_tokens = Decimal(minimum_output) / output_scale
-    target_tokens = Decimal(1)
-    price_impact_pct = float(
-        order.get("priceImpact", float(order.get("priceImpactPct", 0)) * 100)
     )
-    slippage_bps = int(order.get("slippageBps", 0))
+    sizing_order = get_jupiter_order(estimated_input, token["id"])
+    input_amount = int(
+        (
+            Decimal(estimated_input)
+            * Decimal(target_amount)
+            / Decimal(sizing_order["outAmount"])
+        ).to_integral_value(rounding=ROUND_CEILING)
+    )
+    order = get_jupiter_order(input_amount, token["id"], user_public_key)
+
+    raw_transaction = order.get("transaction")
+    request_id = order.get("requestId")
+    if not raw_transaction or not request_id:
+        missing_fields = []
+        if not raw_transaction:
+            missing_fields.append(
+                "transaction is empty"
+                if "transaction" in order
+                else "transaction is missing"
+            )
+        if not request_id:
+            missing_fields.append("requestId is missing")
+
+        provider_details = [
+            f"{field}={str(order[field])[:300]}"
+            for field in ("router", "errorCode", "errorMessage")
+            if order.get(field) not in (None, "")
+        ]
+        details = "; ".join(missing_fields + provider_details)
+        raise ValueError(f"Jupiter did not return an executable order: {details}.")
+
+    versioned_tx = VersionedTransaction.from_bytes(base64.b64decode(raw_transaction))
+    required_signers = versioned_tx.message.account_keys[
+        :versioned_tx.message.header.num_required_signatures
+    ]
+    if user_public_key not in {str(pubkey) for pubkey in required_signers}:
+        raise ValueError("The configured wallet is not a required signer for this order.")
+
+    expected_output = int(order["outAmount"])
+    minimum_output = int(order.get("otherAmountThreshold", expected_output))
+    actual_input = int(order["inAmount"])
+    output_scale = Decimal(10) ** decimals
+    return {
+        "ticker": ticker_symbol,
+        "token_name": token["name"],
+        "token_symbol": token["symbol"],
+        "mint": token["id"],
+        "decimals": decimals,
+        "input_usdc": float(Decimal(actual_input) / Decimal(1_000_000)),
+        "estimated_tokens": float(Decimal(expected_output) / output_scale),
+        "minimum_tokens": float(Decimal(minimum_output) / output_scale),
+        "price_impact_pct": float(
+            order.get("priceImpact", float(order.get("priceImpactPct", 0)) * 100)
+        ),
+        "slippage_bps": int(order.get("slippageBps", 0)),
+        "approval": f"BUY {token['symbol']}",
+        "_keypair": keypair,
+        "_transaction": versioned_tx,
+        "_request_id": request_id,
+    }
+
+
+def execute_prepared_tokenized_stock_purchase(prepared_order: dict) -> str:
+    keypair = prepared_order["_keypair"]
+    versioned_tx = prepared_order["_transaction"]
+    signed_tx = sign_transaction_for_wallet(versioned_tx, keypair)
     headers = {"Content-Type": "application/json"}
     api_key = os.getenv("JUPITER_API_KEY")
     if api_key:
         headers["x-api-key"] = api_key
 
+    response = requests.post(
+        f"{JUPITER_SWAP_URL}/execute",
+        headers=headers,
+        json={
+            "signedTransaction": base64.b64encode(bytes(signed_tx)).decode("ascii"),
+            "requestId": prepared_order["_request_id"],
+        },
+        timeout=30,
+    )
+    try:
+        result = response.json()
+    except ValueError as exc:
+        if _is_insufficient_wallet_funds(response.text):
+            raise RuntimeError("Insufficient Funds") from exc
+        response.raise_for_status()
+        raise RuntimeError("Jupiter returned an invalid execution response.") from exc
+
+    error_details = response.text
+    if isinstance(result, dict):
+        error_details += " " + json.dumps(result, default=str)
+    if _is_insufficient_wallet_funds(error_details):
+        raise RuntimeError("Insufficient Funds")
+
+    response.raise_for_status()
+    if not isinstance(result, dict):
+        raise RuntimeError("Jupiter returned an invalid execution response.")
+    if result.get("status") != "Success":
+        raise RuntimeError(f"Jupiter execution failed: {result}")
+    return result["signature"]
+
+
+def _is_insufficient_wallet_funds(error_details: str) -> bool:
+    normalized = error_details.casefold()
+    return any(
+        phrase in normalized
+        for phrase in (
+            "insufficient funds",
+            "insufficient balance",
+            "insufficient lamports",
+            "attempt to debit an account but found no record",
+        )
+    )
+
+
+def execute_tokenized_stock_purchase(
+    private_key_b58: str,
+    ticker_symbol: str,
+    trade_reason: str,
+):
+    try:
+        prepared_order = prepare_tokenized_stock_purchase(
+            ticker_symbol,
+            private_key_b58=private_key_b58,
+        )
+    except Exception:
+        print("Trade not available natively through Solana")
+        return
+
     print("\n=== Live Tokenized-Stock Trade Approval Required ===")
     print(f"Reason: {trade_reason}")
-    print(f"Asset: {token['name']} ({token['symbol']})")
-    print(f"Mint: {token['id']}")
-    print(f"Target: {target_tokens:.{decimals}f} token (one share's tokenized exposure)")
-    print(f"Pay: {Decimal(actual_input) / Decimal(1_000_000):.6f} USDC")
-    print(f"Estimated receive: {estimated_tokens:.{decimals}f} token")
-    print(f"Minimum receive at quoted slippage: {minimum_tokens:.{decimals}f} token")
-    print(f"Estimated price impact: {price_impact_pct:.4f}%")
-    print(f"Quoted slippage limit: {slippage_bps / 100:.2f}%")
+    print(f"Asset: {prepared_order['token_name']} ({prepared_order['token_symbol']})")
+    print(f"Mint: {prepared_order['mint']}")
+    print(f"Pay: {prepared_order['input_usdc']:.6f} USDC")
+    print(f"Estimated receive: {prepared_order['estimated_tokens']:.8f} token")
+    print(f"Minimum receive at quoted slippage: {prepared_order['minimum_tokens']:.8f} token")
     print("This is an issuer-backed tokenized security, not a brokerage-held share.")
-    print("Jupiter uses exact-input swaps; the amount received may differ from one token.")
-    approval = f"BUY {token['symbol']}"
-    if input(f"Type {approval} to sign and submit this transaction: ").strip() != approval:
+    if input(
+        f"Type {prepared_order['approval']} to sign and submit this transaction: "
+    ).strip() != prepared_order["approval"]:
         print("Trade cancelled; transaction was not signed or broadcast.")
         return
 
     try:
-        signed_tx = sign_transaction_for_wallet(versioned_tx, keypair)
-        execute_response = requests.post(
-            f"{JUPITER_SWAP_URL}/execute",
-            headers=headers,
-            json={
-                "signedTransaction": base64.b64encode(bytes(signed_tx)).decode("ascii"),
-                "requestId": order["requestId"],
-            },
-            timeout=30,
-        )
-        execute_response.raise_for_status()
-        result = execute_response.json()
-        if result.get("status") != "Success":
-            raise RuntimeError(f"Jupiter execution failed: {result}")
-        print(f"[SUCCESS] Jupiter executed the trade. Signature: {result['signature']}")
-    except Exception as e:
-        print(f"[Execution Failed] Error signing or submitting the Jupiter order: {e}")
+        signature = execute_prepared_tokenized_stock_purchase(prepared_order)
+        print(f"[SUCCESS] Jupiter executed the trade. Signature: {signature}")
+    except Exception:
+        print("Insufficient Funds")
 
 def main():
     ticker_symbol = input("Enter the stock ticker to analyze: ").strip().upper()
