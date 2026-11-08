@@ -1,3 +1,4 @@
+import io
 import re
 import secrets
 import threading
@@ -5,6 +6,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -33,7 +37,15 @@ PERIODS = {
     "5D": ("5d", "1h"),
     "1M": ("1mo", "1d"),
     "1Y": ("1y", "1d"),
+    "5Y": ("5y", "1wk"),
 }
+# CPI is published monthly, so inflation comparison only makes sense on long views.
+COMPARE_TIMEFRAMES = {"1Y": PERIODS["1Y"], "5Y": PERIODS["5Y"]}
+# CPI-U, all items, seasonally adjusted (U.S. Bureau of Labor Statistics via FRED).
+CPI_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
+CPI_TTL_SECONDS = 12 * 60 * 60
+cpi_cache = {"series": None, "expires_at": 0.0}
+cpi_lock = threading.Lock()
 FUND_CATALOG = [
     {"symbol": "SPY", "name": "SPDR S&P 500 ETF Trust", "category": "Broad market"},
     {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "category": "Broad market"},
@@ -98,6 +110,12 @@ def to_market_snapshot(ticker, period, interval):
     change = latest - previous
     volume_series = history["Volume"].dropna()
     volume = float(volume_series.iloc[-1]) if not volume_series.empty else 0
+    if interval.endswith(("m", "h")):
+        label_format = "%b %d %H:%M"
+    elif interval.endswith("wk"):
+        label_format = "%b %d, %Y"
+    else:
+        label_format = "%b %d"
     rows = []
     for index, row in history.iterrows():
         close = row.get("Close")
@@ -107,7 +125,7 @@ def to_market_snapshot(ticker, period, interval):
         if volume_value != volume_value:
             volume_value = 0
         rows.append({
-            "date": index.strftime("%b %d %H:%M") if interval.endswith("m") or interval.endswith("h") else index.strftime("%b %d"),
+            "date": index.strftime(label_format),
             "price": round(float(close), 4),
             "ma": round(float(closes.loc[:index].tail(5).mean()), 4),
             "volume": int(volume_value or 0),
@@ -170,6 +188,109 @@ def to_fund_snapshot(ticker, period, interval):
         **get_fund_info(ticker),
     }
     return snapshot
+
+
+def load_cpi_series():
+    """Monthly CPI-U from FRED, cached; falls back to stale data if FRED is unreachable."""
+    now = time.monotonic()
+    with cpi_lock:
+        if cpi_cache["series"] is not None and cpi_cache["expires_at"] > now:
+            return cpi_cache["series"]
+
+    try:
+        response = requests.get(
+            CPI_URL,
+            timeout=20,
+            headers={"User-Agent": "solana-stock-analyzer/1.0"},
+        )
+        response.raise_for_status()
+        frame = pd.read_csv(io.StringIO(response.text))
+        dates = pd.DatetimeIndex(pd.to_datetime(frame.iloc[:, 0]))
+        values = pd.to_numeric(frame.iloc[:, 1], errors="coerce")
+        # Dropping blanks matters: some months (e.g. Oct 2025) were never published.
+        series = pd.Series(values.to_numpy(), index=dates).dropna()
+        series = series[series.index >= "2015-01-01"]
+        if len(series) < 24:
+            raise ValueError("FRED returned too little CPI data.")
+    except Exception:
+        with cpi_lock:
+            if cpi_cache["series"] is not None:
+                return cpi_cache["series"]
+        raise
+
+    with cpi_lock:
+        cpi_cache["series"] = series
+        cpi_cache["expires_at"] = now + CPI_TTL_SECONDS
+    return series
+
+
+def _epoch_seconds(index):
+    return np.asarray(
+        (pd.DatetimeIndex(index) - pd.Timestamp("1970-01-01")) / pd.Timedelta(seconds=1),
+        dtype=float,
+    )
+
+
+def to_inflation_comparison(ticker, timeframe):
+    period, interval = COMPARE_TIMEFRAMES[timeframe]
+    history = yf.Ticker(ticker).history(period=period, interval=interval)
+    if history.empty or history["Close"].dropna().empty:
+        raise ValueError(f"No price history found for {ticker}.")
+    closes = history["Close"].dropna()
+    prices = closes.to_numpy(dtype=float)
+    if prices[0] <= 0:
+        raise ValueError(f"Invalid price history for {ticker}.")
+
+    dates = pd.DatetimeIndex(closes.index)
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    dates = dates.normalize()
+
+    cpi = load_cpi_series()
+    cpi_x = _epoch_seconds(cpi.index)
+    cpi_y = cpi.to_numpy(dtype=float)
+    x = _epoch_seconds(dates)
+    if x[0] < cpi_x[0] or x[0] > cpi_x[-1]:
+        raise ValueError("CPI data does not cover the start of this period.")
+
+    # Both lines are % change since the first stock data point. CPI is linearly
+    # interpolated between monthly readings (which also bridges missing months)
+    # and left blank after the latest published reading instead of extrapolated.
+    base_cpi = float(np.interp(x[0], cpi_x, cpi_y))
+    stock_pct = (prices / prices[0] - 1) * 100
+    covered = x <= cpi_x[-1]
+    inflation_pct = np.where(
+        covered, (np.interp(x, cpi_x, cpi_y) / base_cpi - 1) * 100, np.nan
+    )
+
+    # Headline numbers use the overlap only, so both sides cover the same window.
+    last = int(np.flatnonzero(covered)[-1])
+    stock_change = float(stock_pct[last])
+    inflation_change = float(inflation_pct[last])
+    real_change = ((1 + stock_change / 100) / (1 + inflation_change / 100) - 1) * 100
+
+    series = [
+        {
+            "date": date.strftime("%b %d, %Y"),
+            "stockPct": round(float(stock), 2),
+            "inflationPct": None if np.isnan(inflation) else round(float(inflation), 3),
+        }
+        for date, stock, inflation in zip(dates, stock_pct, inflation_pct)
+    ]
+    return {
+        "ticker": ticker,
+        "name": POPULAR_NAMES.get(ticker, ticker),
+        "timeframe": timeframe,
+        "series": series,
+        "summary": {
+            "stockChangePct": round(stock_change, 2),
+            "inflationPct": round(inflation_change, 2),
+            "realChangePct": round(real_change, 2),
+            "comparedThrough": dates[last].strftime("%b %d, %Y"),
+            "cpiLatestMonth": cpi.index[-1].strftime("%B %Y"),
+        },
+        "source": "U.S. Bureau of Labor Statistics CPI-U (seasonally adjusted) via FRED",
+    }
 
 
 @app.get("/api/health")
@@ -248,6 +369,24 @@ def funds(timeframe: str = "1M", category: str | None = None):
         "funds": results,
         "errors": errors,
     }
+
+
+@app.get("/api/compare/{ticker}")
+def inflation_comparison(ticker: str, timeframe: str = "1Y"):
+    ticker = normalize_ticker(ticker)
+    timeframe = timeframe.upper()
+    if timeframe not in COMPARE_TIMEFRAMES:
+        raise HTTPException(
+            status_code=422,
+            detail="Inflation comparison supports the 1Y and 5Y views.",
+        )
+    try:
+        return to_inflation_comparison(ticker, timeframe)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not compare {ticker} with inflation: {exc}",
+        ) from exc
 
 
 @app.post("/api/analyze")

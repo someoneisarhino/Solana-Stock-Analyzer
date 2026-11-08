@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
   CartesianGrid,
+  Legend,
   Line,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -19,6 +21,7 @@ import {
   Search,
   ShieldCheck,
   Sparkles,
+  TrendingUp,
 } from "lucide-react";
 
 type PricePoint = {
@@ -89,11 +92,34 @@ type FundsResponse = {
   errors: Record<string, string>;
 };
 
+type ComparePoint = {
+  date: string;
+  stockPct: number;
+  inflationPct: number | null;
+};
+
+type CompareData = {
+  ticker: string;
+  name: string;
+  timeframe: Timeframe;
+  series: ComparePoint[];
+  summary: {
+    stockChangePct: number;
+    inflationPct: number;
+    realChangePct: number;
+    comparedThrough: string;
+    cpiLatestMonth: string;
+  };
+  source: string;
+};
+
 type ApiError = { detail?: string };
-type Timeframe = "1D" | "5D" | "1M" | "1Y";
+type Timeframe = "1D" | "5D" | "1M" | "1Y" | "5Y";
 
 const POPULAR = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "INTC", "GOOG", "AMZN"];
-const TIMEFRAMES: Timeframe[] = ["1D", "5D", "1M", "1Y"];
+const TIMEFRAMES: Timeframe[] = ["1D", "5D", "1M", "1Y", "5Y"];
+// CPI is monthly, so inflation comparison is only offered on the long views.
+const COMPARE_RANGES: Timeframe[] = ["1Y", "5Y"];
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -138,6 +164,13 @@ function App() {
   const [tickerInput, setTickerInput] = useState("");
   const [selectedTicker, setSelectedTicker] = useState("NVDA");
   const [selectedStock, setSelectedStock] = useState<StockSnapshot | null>(null);
+  const [chartRange, setChartRange] = useState<Timeframe>("1M");
+  const [chartLoading, setChartLoading] = useState(false);
+  const chartRequest = useRef(0);
+  const [showInflation, setShowInflation] = useState(false);
+  const [compare, setCompare] = useState<CompareData | null>(null);
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [compareError, setCompareError] = useState("");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState("");
@@ -206,16 +239,63 @@ function App() {
     };
   }, [page, timeframe]);
 
-  async function loadStock(ticker: string) {
+  async function loadStock(ticker: string, range: Timeframe, requestId: number) {
     const result = await api<{ stocks: Record<string, StockSnapshot>; errors: Record<string, string> }>(
-      `/api/market?symbols=${encodeURIComponent(ticker)}&timeframe=${timeframe}`,
+      `/api/market?symbols=${encodeURIComponent(ticker)}&timeframe=${range}`,
     );
     const snapshot = result.stocks[ticker];
     if (!snapshot) throw new Error(result.errors[ticker] || `No market data available for ${ticker}.`);
-    setSelectedStock(snapshot);
+    // Ignore responses that were overtaken by a newer request.
+    if (requestId === chartRequest.current) setSelectedStock(snapshot);
   }
 
-  async function runAnalysis(value = tickerInput) {
+  async function changeChartRange(range: Timeframe) {
+    setChartRange(range);
+    if (!analysis) return;
+    const requestId = ++chartRequest.current;
+    setAnalysisError("");
+    setChartLoading(true);
+    try {
+      await loadStock(analysis.ticker, range, requestId);
+    } catch (error) {
+      setAnalysisError((error as Error).message);
+    } finally {
+      if (requestId === chartRequest.current) setChartLoading(false);
+    }
+  }
+
+  function toggleInflation() {
+    if (showInflation) {
+      setShowInflation(false);
+      return;
+    }
+    setShowInflation(true);
+    if (!COMPARE_RANGES.includes(chartRange)) void changeChartRange("1Y");
+  }
+
+  useEffect(() => {
+    if (!showInflation || !analysis || !COMPARE_RANGES.includes(chartRange)) return;
+    let active = true;
+    setCompareLoading(true);
+    setCompareError("");
+    api<CompareData>(`/api/compare/${encodeURIComponent(analysis.ticker)}?timeframe=${chartRange}`)
+      .then((result) => {
+        if (!active) return;
+        setCompare(result);
+        setCompareLoading(false);
+      })
+      .catch((error: Error) => {
+        if (!active) return;
+        setCompare(null);
+        setCompareError(error.message);
+        setCompareLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [showInflation, analysis, chartRange]);
+
+  async function runAnalysis(value = tickerInput, range: Timeframe = chartRange) {
     const ticker = value.trim().toUpperCase();
     if (!ticker) {
       setAnalysisError("Enter a stock ticker to analyze.");
@@ -223,6 +303,10 @@ function App() {
     }
 
     setPage("search");
+    setChartRange(range);
+    setShowInflation(false);
+    setCompare(null);
+    setCompareError("");
     setSelectedTicker(ticker);
     setTickerInput(ticker);
     setAnalysis(null);
@@ -239,7 +323,8 @@ function App() {
       });
       setAnalysis(result);
       try {
-        await loadStock(ticker);
+        const requestId = ++chartRequest.current;
+        await loadStock(ticker, range, requestId);
       } catch {
         setSelectedStock(null);
       }
@@ -305,7 +390,7 @@ function App() {
     setPage("search");
     if (ticker) {
       setTickerInput(ticker);
-      void runAnalysis(ticker);
+      void runAnalysis(ticker, timeframe);
     }
   };
 
@@ -377,7 +462,7 @@ function App() {
               <div className="flex flex-wrap items-end justify-between gap-4">
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Exchange-traded funds</p>
-                  <h1 className="mt-2 text-3xl font-bold">Popular Funds</h1>
+                  <h1 className="mt-2 text-3xl font-bold">Popular funds</h1>
                   <p className="mt-2 max-w-2xl text-sm text-slate-400">Broad-market, sector, bond and commodity ETFs with Yahoo Finance price history. Select a fund to run the same decision engine and Gemini background used for stocks.</p>
                 </div>
                 <TimeframeToggle value={timeframe} onChange={setTimeframe} />
@@ -412,7 +497,7 @@ function App() {
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Stock decision engine</p>
               <h1 className="mt-2 text-3xl font-bold">Analyze a ticker</h1>
-              <p className="mt-2 text-sm text-slate-400">The server runs the analysis and summary; no trade is submitted without your approval.</p>
+              <p className="mt-2 text-sm text-slate-400">The server runs the Python algorithm and Gemini Flash summary; no trade is submitted without your approval.</p>
             </div>
             <form className="flex max-w-3xl gap-3" onSubmit={(event) => { event.preventDefault(); void runAnalysis(); }}>
               <label className="relative flex-1">
@@ -442,7 +527,21 @@ function App() {
                       <Metric label="Liquidity check" value={analysis.metrics.is_safe_liquidity ? "Passed" : "Below threshold"} />
                       <Metric label="Comparison points" value={String(analysis.metrics.comparison_periods ?? "—")} />
                     </div>}
-                    {selectedStock && selectedStock.symbol === analysis.ticker && <div className="mt-6 h-64">
+                    {selectedStock && selectedStock.symbol === analysis.ticker && <div className="mt-6">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h3 className="text-sm font-semibold text-slate-300">{showInflation ? "Stock vs. USD inflation" : "Price trend"}</h3>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button onClick={toggleInflation} aria-pressed={showInflation} className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs ${showInflation ? "border-amber-300 bg-amber-300 font-semibold text-slate-950" : "border-slate-700 text-slate-300 hover:border-amber-300/60 hover:text-white"}`}><TrendingUp size={14} />Inflation Comparison</button>
+                          <TimeframeToggle value={chartRange} onChange={(range) => void changeChartRange(range)} allowed={showInflation ? COMPARE_RANGES : undefined} />
+                        </div>
+                      </div>
+                      {showInflation ? (
+                        <InflationComparison
+                          data={compare && compare.ticker === analysis.ticker && compare.timeframe === chartRange ? compare : null}
+                          loading={compareLoading}
+                          error={compareError}
+                        />
+                      ) : <div className={`mt-4 h-64 transition-opacity ${chartLoading ? "opacity-50" : ""}`}>
                       <ResponsiveContainer width="100%" height="100%">
                         <AreaChart data={selectedStock.history}>
                           <defs><linearGradient id="priceFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#22d3ee" stopOpacity={0.28} /><stop offset="100%" stopColor="#22d3ee" stopOpacity={0} /></linearGradient></defs>
@@ -454,6 +553,7 @@ function App() {
                           <Line type="monotone" dataKey="ma" stroke="#a78bfa" dot={false} strokeWidth={1.5} name="5-point average" />
                         </AreaChart>
                       </ResponsiveContainer>
+                    </div>}
                     </div>}
                   </div>
                   <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
@@ -536,12 +636,47 @@ function StockCard({ stock, onSelect }: { stock: StockSnapshot; onSelect: () => 
   );
 }
 
-function TimeframeToggle({ value, onChange }: { value: Timeframe; onChange: (range: Timeframe) => void }) {
+function TimeframeToggle({ value, onChange, allowed }: { value: Timeframe; onChange: (range: Timeframe) => void; allowed?: Timeframe[] }) {
   return (
     <div className="flex rounded-lg border border-slate-800 bg-slate-900 p-1">
-      {TIMEFRAMES.map((range) => (
-        <button key={range} onClick={() => onChange(range)} className={`rounded-md px-3 py-1.5 text-xs ${value === range ? "bg-cyan-300 font-semibold text-slate-950" : "text-slate-400 hover:text-white"}`}>{range}</button>
-      ))}
+      {TIMEFRAMES.map((range) => {
+        const blocked = allowed !== undefined && !allowed.includes(range);
+        return (
+          <button key={range} disabled={blocked} title={blocked ? "Inflation data is monthly, so this view needs 1Y or 5Y" : undefined} onClick={() => onChange(range)} className={`rounded-md px-3 py-1.5 text-xs ${value === range ? "bg-cyan-300 font-semibold text-slate-950" : blocked ? "cursor-not-allowed text-slate-700" : "text-slate-400 hover:text-white"}`}>{range}</button>
+        );
+      })}
+    </div>
+  );
+}
+
+function InflationComparison({ data, loading, error }: { data: CompareData | null; loading: boolean; error: string }) {
+  if (error) return <div className="mt-4"><ErrorBanner message={error} /></div>;
+  if (loading || !data) return <div className="mt-4"><Loading label="Loading CPI data from FRED..." /></div>;
+  const { summary } = data;
+  const signed = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+  return (
+    <div className="mt-4 space-y-4">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <Metric label="Stock price change" value={signed(summary.stockChangePct)} />
+        <Metric label="USD inflation (CPI)" value={signed(summary.inflationPct)} />
+        <Metric label="Inflation-adjusted change" value={signed(summary.realChangePct)} />
+      </div>
+      <div className="h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data.series}>
+            <defs><linearGradient id="compareFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#22d3ee" stopOpacity={0.22} /><stop offset="100%" stopColor="#22d3ee" stopOpacity={0} /></linearGradient></defs>
+            <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" />
+            <XAxis dataKey="date" tick={{ fill: "#64748b", fontSize: 10 }} minTickGap={56} />
+            <YAxis domain={["auto", "auto"]} tick={{ fill: "#64748b", fontSize: 10 }} tickFormatter={(value: number) => `${value}%`} width={55} />
+            <ReferenceLine y={0} stroke="#334155" />
+            <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 10 }} formatter={(value, name) => [`${Number(value).toFixed(2)}%`, String(name)]} />
+            <Legend wrapperStyle={{ fontSize: 11, color: "#94a3b8" }} />
+            <Area type="monotone" dataKey="stockPct" stroke="#22d3ee" fill="url(#compareFill)" strokeWidth={2} name="Stock price change" />
+            <Line type="monotone" dataKey="inflationPct" stroke="#fbbf24" dot={false} strokeWidth={2} name="USD inflation (CPI)" />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="text-xs leading-5 text-slate-500">Both lines show % change since the start of the period. Figures are measured through {summary.comparedThrough}: CPI is published monthly with a delay, and the latest reading is {summary.cpiLatestMonth}, so the inflation line ends before the stock line. Source: {data.source}.</p>
     </div>
   );
 }

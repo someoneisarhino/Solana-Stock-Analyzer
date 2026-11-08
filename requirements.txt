@@ -1,5 +1,7 @@
 fastapi
 google-generativeai
+numpy
+pandas
 python-dotenv
 requests
 solders
