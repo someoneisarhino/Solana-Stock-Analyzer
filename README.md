@@ -66,5 +66,6 @@ token/share.
 - Buy/Sell/Hold conclusions for each stock
 - Convenient Solana buying option for recommended stocks through Jupiter
 - EFT trends and analysis
+- Inflation rate comparison to stock trends
 
 Some trades cannot be made through Solana because Jupiter doesn't support certain ones through their API (ex. NVDA)
