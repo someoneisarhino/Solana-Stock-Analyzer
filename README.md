@@ -65,5 +65,6 @@ token/share.
 - Google Gemini driven summary of each stock
 - Buy/Sell/Hold conclusions for each stock
 - Convenient Solana buying option for recommended stocks through Jupiter
+- EFT trends and analysis
 
 Some trades cannot be made through Solana because Jupiter doesn't support certain ones through their API (ex. NVDA)
