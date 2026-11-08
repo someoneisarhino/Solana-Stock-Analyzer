@@ -17,7 +17,7 @@ SOLANA_PRIVATE_KEY=
 # Optional: improves Jupiter API rate limits
 JUPITER_API_KEY=
 ```
-
+SOLANA_PRIVATE_KEY should be in Base58 and be either 32-byte or 64-byte.
 
 Never commit or share `.env`.
 
@@ -65,3 +65,5 @@ token/share.
 - Google Gemini driven summary of each stock
 - Buy/Sell/Hold conclusions for each stock
 - Convenient Solana buying option for recommended stocks through Jupiter
+
+Some trades cannot be made through Solana because Jupiter doesn't support certain ones through their API (ex. NVDA)
