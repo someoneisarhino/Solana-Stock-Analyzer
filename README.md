@@ -44,6 +44,10 @@ PowerShell terminals:
 ```powershell
 npm run dev
 ```
+OR run command:
+```
+.\run_dashboard.bat
+```
 
 Open the Vite URL printed in the terminal (normally
 `http://127.0.0.1:5173`). The Python API is available at
