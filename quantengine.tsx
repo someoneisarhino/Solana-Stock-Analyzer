@@ -19,7 +19,6 @@ import {
   Search,
   ShieldCheck,
   Sparkles,
-  Wallet,
 } from "lucide-react";
 
 type PricePoint = {
@@ -72,6 +71,24 @@ type TradeQuote = {
   expiresInSeconds: number;
 };
 
+type FundMeta = {
+  category: string;
+  expenseRatio: number | null;
+  yieldPct: number | null;
+  totalAssets: number | null;
+};
+
+type FundSnapshot = StockSnapshot & { fund: FundMeta };
+
+type FundCatalogEntry = { symbol: string; name: string; category: string };
+
+type FundsResponse = {
+  catalog: FundCatalogEntry[];
+  categories: string[];
+  funds: Record<string, FundSnapshot>;
+  errors: Record<string, string>;
+};
+
 type ApiError = { detail?: string };
 type Timeframe = "1D" | "5D" | "1M" | "1Y";
 
@@ -106,11 +123,17 @@ function compactNumber(value: number) {
 }
 
 function App() {
-  const [page, setPage] = useState<"home" | "search">("home");
+  const [page, setPage] = useState<"home" | "funds" | "search">("home");
   const [timeframe, setTimeframe] = useState<Timeframe>("1M");
   const [stocks, setStocks] = useState<Record<string, StockSnapshot>>({});
   const [marketErrors, setMarketErrors] = useState<Record<string, string>>({});
   const [marketLoading, setMarketLoading] = useState(true);
+  const [funds, setFunds] = useState<Record<string, FundSnapshot>>({});
+  const [fundCatalog, setFundCatalog] = useState<FundCatalogEntry[]>([]);
+  const [fundCategories, setFundCategories] = useState<string[]>([]);
+  const [fundCategory, setFundCategory] = useState("All");
+  const [fundErrors, setFundErrors] = useState<Record<string, string>>({});
+  const [fundsLoading, setFundsLoading] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [tickerInput, setTickerInput] = useState("");
   const [selectedTicker, setSelectedTicker] = useState("NVDA");
@@ -159,6 +182,29 @@ function App() {
       active = false;
     };
   }, [timeframe]);
+
+  useEffect(() => {
+    if (page !== "funds") return;
+    let active = true;
+    setFundsLoading(true);
+    api<FundsResponse>(`/api/funds?timeframe=${timeframe}`)
+      .then((result) => {
+        if (!active) return;
+        setFunds(result.funds);
+        setFundCatalog(result.catalog);
+        setFundCategories(result.categories);
+        setFundErrors(result.errors);
+        setFundsLoading(false);
+      })
+      .catch((error: Error) => {
+        if (!active) return;
+        setFundErrors({ funds: error.message });
+        setFundsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [page, timeframe]);
 
   async function loadStock(ticker: string) {
     const result = await api<{ stocks: Record<string, StockSnapshot>; errors: Record<string, string> }>(
@@ -276,6 +322,7 @@ function App() {
           </button>
           <nav className="flex items-center gap-2">
             <button onClick={() => setPage("home")} className={`rounded-lg px-4 py-2 text-sm ${page === "home" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white"}`}>Markets</button>
+            <button onClick={() => setPage("funds")} className={`rounded-lg px-4 py-2 text-sm ${page === "funds" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white"}`}>Popular Funds</button>
             <button onClick={() => setPage("search")} className={`rounded-lg px-4 py-2 text-sm ${page === "search" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white"}`}>Analyze</button>
             <div className="ml-2 hidden items-center gap-2 rounded-full border border-slate-800 px-3 py-2 text-xs text-slate-400 sm:flex">
               <span className={`h-2 w-2 rounded-full ${health?.walletConfigured ? "bg-emerald-400" : "bg-slate-600"}`} />
@@ -308,11 +355,7 @@ function App() {
                   <h2 className="text-xl font-bold">Popular stocks</h2>
                   <p className="mt-1 text-sm text-slate-500">Yahoo Finance price history · refreshes when timeframe changes</p>
                 </div>
-                <div className="flex rounded-lg border border-slate-800 bg-slate-900 p-1">
-                  {TIMEFRAMES.map((range) => (
-                    <button key={range} onClick={() => setTimeframe(range)} className={`rounded-md px-3 py-1.5 text-xs ${timeframe === range ? "bg-cyan-300 font-semibold text-slate-950" : "text-slate-400 hover:text-white"}`}>{range}</button>
-                  ))}
-                </div>
+                <TimeframeToggle value={timeframe} onChange={setTimeframe} />
               </div>
               {marketErrors.market && <ErrorBanner message={marketErrors.market} />}
               {marketLoading && <Loading label="Loading market data from Yahoo Finance..." />}
@@ -328,6 +371,42 @@ function App() {
             </section>
             <p className="text-xs leading-5 text-slate-600">Market data and algorithm results are informational, not investment advice. Tokenized securities are not brokerage-held shares and may be restricted by issuer eligibility rules.</p>
           </>
+        ) : page === "funds" ? (
+          <>
+            <section className="space-y-6">
+              <div className="flex flex-wrap items-end justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Exchange-traded funds</p>
+                  <h1 className="mt-2 text-3xl font-bold">Popular funds</h1>
+                  <p className="mt-2 max-w-2xl text-sm text-slate-400">Broad-market, sector, bond and commodity ETFs with Yahoo Finance price history. Select a fund to run the same decision engine and Gemini background used for stocks.</p>
+                </div>
+                <TimeframeToggle value={timeframe} onChange={setTimeframe} />
+              </div>
+
+              {fundCategories.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {["All", ...fundCategories].map((category) => (
+                    <button key={category} onClick={() => setFundCategory(category)} className={`rounded-full border px-3.5 py-1.5 text-xs ${fundCategory === category ? "border-cyan-300 bg-cyan-300 font-semibold text-slate-950" : "border-slate-800 bg-slate-900 text-slate-400 hover:text-white"}`}>{category}</button>
+                  ))}
+                </div>
+              )}
+
+              {fundErrors.funds && <ErrorBanner message={fundErrors.funds} />}
+              {fundsLoading && <Loading label="Loading fund data from Yahoo Finance..." />}
+              {!fundsLoading && (
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                  {fundCatalog
+                    .filter((entry) => fundCategory === "All" || entry.category === fundCategory)
+                    .map((entry) => {
+                      const fund = funds[entry.symbol];
+                      if (!fund) return <ErrorBanner key={entry.symbol} message={`${entry.symbol}: ${fundErrors[entry.symbol] || "Fund data unavailable."}`} />;
+                      return <FundCard key={entry.symbol} fund={fund} onSelect={() => openSearch(entry.symbol)} />;
+                    })}
+                </div>
+              )}
+            </section>
+            <p className="text-xs leading-5 text-slate-600">Fund data and algorithm results are informational, not investment advice. Expense ratio, yield and assets come from Yahoo Finance when available. A tokenized Solana version exists only for some funds, so a quote may be unavailable even after a BUY signal.</p>
+          </>
         ) : (
           <section className="space-y-6">
             <div>
@@ -338,7 +417,7 @@ function App() {
             <form className="flex max-w-3xl gap-3" onSubmit={(event) => { event.preventDefault(); void runAnalysis(); }}>
               <label className="relative flex-1">
                 <Search className="absolute left-4 top-3.5 text-slate-500" size={18} />
-                <input value={tickerInput} onChange={(event) => setTickerInput(event.target.value)} placeholder="Enter a ticker, such as AAPL" maxLength={12} className="w-full rounded-xl border border-slate-800 bg-slate-900 py-3 pl-11 pr-4 outline-none focus:border-cyan-400" />
+                <input value={tickerInput} onChange={(event) => setTickerInput(event.target.value)} placeholder="Enter a ticker, such as AAPL or SPY" maxLength={12} className="w-full rounded-xl border border-slate-800 bg-slate-900 py-3 pl-11 pr-4 outline-none focus:border-cyan-400" />
               </label>
               <button disabled={analysisLoading} className="rounded-xl bg-cyan-300 px-5 font-semibold text-slate-950 disabled:opacity-50">{analysisLoading ? "Analyzing..." : "Analyze"}</button>
             </form>
@@ -453,6 +532,46 @@ function StockCard({ stock, onSelect }: { stock: StockSnapshot; onSelect: () => 
         </ResponsiveContainer>
       </div>
       <div className="mt-3 flex justify-between text-xs text-slate-500"><span>Range: {money(stock.periodLow)} – {money(stock.periodHigh)}</span><span className="flex items-center gap-1 text-cyan-300">Analyze <ArrowUpRight size={13} /></span></div>
+    </button>
+  );
+}
+
+function TimeframeToggle({ value, onChange }: { value: Timeframe; onChange: (range: Timeframe) => void }) {
+  return (
+    <div className="flex rounded-lg border border-slate-800 bg-slate-900 p-1">
+      {TIMEFRAMES.map((range) => (
+        <button key={range} onClick={() => onChange(range)} className={`rounded-md px-3 py-1.5 text-xs ${value === range ? "bg-cyan-300 font-semibold text-slate-950" : "text-slate-400 hover:text-white"}`}>{range}</button>
+      ))}
+    </div>
+  );
+}
+
+function FundCard({ fund, onSelect }: { fund: FundSnapshot; onSelect: () => void }) {
+  const positive = fund.change >= 0;
+  const tone = positive ? "#34d399" : "#fb7185";
+  const { expenseRatio, yieldPct, totalAssets } = fund.fund;
+  return (
+    <button onClick={onSelect} className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 text-left transition hover:border-cyan-400/50 hover:bg-slate-900">
+      <div className="flex items-start justify-between gap-3">
+        <div><p className="font-bold">{fund.symbol}</p><p className="mt-1 text-xs text-slate-500">{fund.name}</p></div>
+        <span className={`text-xs font-semibold ${positive ? "text-emerald-300" : "text-rose-300"}`}>{positive ? "+" : ""}{fund.changePct.toFixed(2)}%</span>
+      </div>
+      <span className="mt-3 inline-block rounded-full border border-cyan-400/20 bg-cyan-400/5 px-2.5 py-1 text-[11px] text-cyan-300">{fund.fund.category}</span>
+      <div className="mt-3 flex items-end justify-between"><span className="text-2xl font-semibold">{money(fund.price)}</span><span className="text-xs text-slate-500">Vol {compactNumber(fund.volume)}</span></div>
+      <div className="mt-4 h-24">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={fund.history}>
+            <defs><linearGradient id={`fund-fill-${fund.symbol}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={tone} stopOpacity={0.22} /><stop offset="100%" stopColor={tone} stopOpacity={0} /></linearGradient></defs>
+            <Area type="monotone" dataKey="price" stroke={tone} fill={`url(#fund-fill-${fund.symbol})`} strokeWidth={1.7} dot={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="mt-4 grid grid-cols-3 gap-2">
+        <Metric label="Expense ratio" value={expenseRatio === null ? "—" : `${expenseRatio.toFixed(2)}%`} />
+        <Metric label="Yield" value={yieldPct === null ? "—" : `${yieldPct.toFixed(2)}%`} />
+        <Metric label="Assets" value={totalAssets === null ? "—" : `$${compactNumber(totalAssets)}`} />
+      </div>
+      <div className="mt-3 flex justify-between text-xs text-slate-500"><span>Range: {money(fund.periodLow)} – {money(fund.periodHigh)}</span><span className="flex items-center gap-1 text-cyan-300">Analyze <ArrowUpRight size={13} /></span></div>
     </button>
   );
 }

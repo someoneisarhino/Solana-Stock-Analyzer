@@ -34,6 +34,27 @@ PERIODS = {
     "1M": ("1mo", "1d"),
     "1Y": ("1y", "1d"),
 }
+FUND_CATALOG = [
+    {"symbol": "SPY", "name": "SPDR S&P 500 ETF Trust", "category": "Broad market"},
+    {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "category": "Broad market"},
+    {"symbol": "VTI", "name": "Vanguard Total Stock Market ETF", "category": "Broad market"},
+    {"symbol": "QQQ", "name": "Invesco QQQ Trust", "category": "Growth & tech"},
+    {"symbol": "XLK", "name": "Technology Select Sector SPDR Fund", "category": "Growth & tech"},
+    {"symbol": "IWM", "name": "iShares Russell 2000 ETF", "category": "Small cap"},
+    {"symbol": "VEA", "name": "Vanguard FTSE Developed Markets ETF", "category": "International"},
+    {"symbol": "VWO", "name": "Vanguard FTSE Emerging Markets ETF", "category": "International"},
+    {"symbol": "BND", "name": "Vanguard Total Bond Market ETF", "category": "Bonds"},
+    {"symbol": "AGG", "name": "iShares Core U.S. Aggregate Bond ETF", "category": "Bonds"},
+    {"symbol": "GLD", "name": "SPDR Gold Shares", "category": "Commodities"},
+    {"symbol": "SCHD", "name": "Schwab U.S. Dividend Equity ETF", "category": "Dividend"},
+]
+FUND_CATEGORIES = list(dict.fromkeys(item["category"] for item in FUND_CATALOG))
+FUND_BY_SYMBOL = {item["symbol"]: item for item in FUND_CATALOG}
+# Register fund names so /api/market and /api/analyze label them correctly.
+POPULAR_NAMES.update({item["symbol"]: item["name"] for item in FUND_CATALOG})
+FUND_INFO_TTL_SECONDS = 6 * 60 * 60
+fund_info_cache = {}
+fund_info_lock = threading.Lock()
 PENDING_ORDER_TTL_SECONDS = 300
 pending_orders = {}
 pending_orders_lock = threading.Lock()
@@ -107,6 +128,50 @@ def to_market_snapshot(ticker, period, interval):
     }
 
 
+def _number_or_none(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def get_fund_info(ticker):
+    """Best-effort fund facts from Yahoo Finance, cached because .info is slow."""
+    now = time.monotonic()
+    with fund_info_lock:
+        cached = fund_info_cache.get(ticker)
+        if cached and cached["expires_at"] > now:
+            return cached["value"]
+
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        info = {}
+
+    yield_fraction = _number_or_none(info.get("yield"))
+    value = {
+        # Yahoo reports netExpenseRatio already in percent (0.03 means 0.03%).
+        "expenseRatio": _number_or_none(info.get("netExpenseRatio")),
+        "yieldPct": yield_fraction * 100 if yield_fraction is not None else None,
+        "totalAssets": _number_or_none(info.get("totalAssets")),
+    }
+    # Only cache when Yahoo returned something, so a transient failure retries.
+    if any(item is not None for item in value.values()):
+        with fund_info_lock:
+            fund_info_cache[ticker] = {"value": value, "expires_at": now + FUND_INFO_TTL_SECONDS}
+    return value
+
+
+def to_fund_snapshot(ticker, period, interval):
+    snapshot = to_market_snapshot(ticker, period, interval)
+    snapshot["fund"] = {
+        "category": FUND_BY_SYMBOL[ticker]["category"],
+        **get_fund_info(ticker),
+    }
+    return snapshot
+
+
 @app.get("/api/health")
 def health():
     public_key = None
@@ -150,6 +215,39 @@ def market(symbols: str = "NVDA,AAPL,MSFT,TSLA,SPY,INTC,GOOG,AMZN", timeframe: s
         except Exception as exc:
             errors[ticker] = str(exc)
     return {"stocks": results, "errors": errors}
+
+
+@app.get("/api/funds")
+def funds(timeframe: str = "1M", category: str | None = None):
+    timeframe = timeframe.upper()
+    if timeframe not in PERIODS:
+        raise HTTPException(status_code=422, detail="Unsupported chart timeframe.")
+    if category is not None and category not in FUND_CATEGORIES:
+        raise HTTPException(status_code=422, detail="Unknown fund category.")
+    catalog = [
+        item for item in FUND_CATALOG
+        if category is None or item["category"] == category
+    ]
+    period, interval = PERIODS[timeframe]
+
+    with ThreadPoolExecutor(max_workers=min(max(len(catalog), 1), 6)) as executor:
+        futures = {
+            item["symbol"]: executor.submit(to_fund_snapshot, item["symbol"], period, interval)
+            for item in catalog
+        }
+    results = {}
+    errors = {}
+    for ticker, future in futures.items():
+        try:
+            results[ticker] = future.result()
+        except Exception as exc:
+            errors[ticker] = str(exc)
+    return {
+        "catalog": catalog,
+        "categories": FUND_CATEGORIES,
+        "funds": results,
+        "errors": errors,
+    }
 
 
 @app.post("/api/analyze")
