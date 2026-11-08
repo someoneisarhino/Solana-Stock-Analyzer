@@ -69,3 +69,7 @@ token/share.
 - Inflation rate comparison to stock trends
 
 Some trades cannot be made through Solana because Jupiter doesn't support certain ones through their API (ex. NVDA)
+
+<img width="1206" height="681" alt="image" src="https://github.com/user-attachments/assets/eafd3247-803d-42e0-a45c-2bfc8dc9318b" />
+<img width="1003" height="494" alt="image" src="https://github.com/user-attachments/assets/c6dcc0a3-f4b0-487b-82b3-2d147a901247" />
+
